@@ -1,0 +1,654 @@
+#!/usr/bin/env bash
+#
+# run-agent-task.sh
+#
+# Runs an arbitrary command inside a disposable smolvm microVM, with a
+# repo checked out and a Claude Code credential available if the command
+# needs it.
+#
+#   1. Re-authenticates Claude Code on the HOST (not in the VM) via
+#      `claude setup-token`, on a schedule controlled by a timestamp file,
+#      and writes the resulting 1-year OAuth token into a read-only mount
+#      for the task VM. Inside the guest, the token is exported as
+#      CLAUDE_CODE_OAUTH_TOKEN right before your command runs.
+#   2. Obtains a repo credential, one of two ways:
+#        a) GH_APP_* vars set: mints a short-lived GitHub App installation
+#           token on the host and writes it to a file that's bind-mounted
+#           into the guest. A background loop on the host re-mints and
+#           overwrites that file every TOKEN_REFRESH_INTERVAL_SECONDS for
+#           as long as the task runs, so long-running tasks that keep
+#           committing and pushing never see the token expire. The guest
+#           never sees the App's private key, only the derived tokens.
+#        b) Otherwise: uses a static DEPLOY_TOKEN env var, embedded once
+#           at clone time and stripped from git config immediately after.
+#           Simpler, but fixed-lifetime -- fine for short tasks only.
+#   3. Builds a per-task Smolfile with an egress allowlist and the
+#      relevant read-only mounts.
+#   4. Boots the VM and clones the target repo.
+#   5. Runs whatever command you give it after `--`, from inside the repo.
+#   6. Tears the VM down and stops the token refresher (unless --keep).
+#
+# Usage:
+#   ./run-agent-task.sh <repo-url> [--gpu] [--keep] -- <command> [args...]
+#
+# Examples (static token, short task):
+#   export DEPLOY_TOKEN=ghp_xxxxx
+#   ./run-agent-task.sh https://github.com/yourorg/yourrepo.git -- \
+#       npx @eventmodelers/cli run --modeling
+#
+# Examples (GitHub App, long-running task that keeps pushing commits):
+#   export GH_APP_ID=123456
+#   export GH_APP_PRIVATE_KEY_PATH=~/secrets/my-app.pem
+#   export GH_APP_INSTALLATION_ID=789012
+#   ./run-agent-task.sh https://github.com/yourorg/yourrepo.git -- \
+#       npx -y @anthropic-ai/claude-code@2.0.0 "Implement the feature in ISSUE.md, committing as you go"
+#
+# Env vars:
+#   DEPLOY_TOKEN                required if not using a GitHub App.
+#   GH_APP_ID                   GitHub App ID. Enables App-based auth.
+#   GH_APP_PRIVATE_KEY_PATH     path to the App's PEM private key. Host-only,
+#                               never mounted into the guest.
+#   GH_APP_INSTALLATION_ID      installation ID the App is installed under
+#                               for the target repo.
+#   TOKEN_REFRESH_INTERVAL_SECONDS  optional. Default 2700 (45 min). Keep
+#                               well under the 60-minute token lifetime.
+#   CLAUDE_REAUTH_DAYS          optional. Days before re-running `claude
+#                               setup-token` on the host. Default 350,
+#                               since the resulting token lasts 1 year.
+#   ALLOW_HOSTS_EXTRA           optional. Extra space-separated egress
+#                               hosts, e.g. "pypi.org files.pythonhosted.org"
+#   IMAGE                       optional. Base OCI image. Default node:24-slim
+#                               (Active LTS as of late 2026 -- Node 20 is EOL;
+#                               bump this yourself as LTS lines move on).
+#   SETUP_EXTRA                 optional. One additional shell command run
+#                               during VM setup, after the baseline git
+#                               install (chain steps yourself with &&).
+#   MOUNTS_EXTRA                optional. Extra non-security bind mounts,
+#                               space-separated "host:guest[:ro]" entries.
+#                               Directories only -- smolvm does not support
+#                               mounting single files, e.g.
+#                               "/home/me/.npm-cache:/root/.npm"
+#   NET_BACKEND                  optional. e.g. "virtio-net" for a real
+#                               virtual NIC instead of smolvm's default
+#                               lightweight TCP/UDP passthrough -- try this
+#                               if a long-lived connection (WebSocket, SSE)
+#                               isn't receiving pushed data the way it does
+#                               outside the sandbox.
+#   LOG_FILE                     optional. Path inside the guest (e.g.
+#                               /tmp/agent.log) to write the command's
+#                               stdout+stderr to, so a long-running command
+#                               can be inspected from a second terminal with
+#                               `smolvm machine exec --name <id> -- cat <path>`.
+#   ALLOW_ALL_HOSTS              DEBUG ONLY. Set to 1 to omit the egress
+#                               allowlist entirely (unrestricted network),
+#                               to test whether a failure is caused by the
+#                               allowlist at all.
+#   NET_LOG                      DEBUG ONLY. Set to 1 to preload a hook that
+#                               logs every hostname the command's Node
+#                               processes connect to (stderr, so it lands in
+#                               LOG_FILE if set).
+#   TASK_ENV_FILE                optional. Path to a dotenv-style file
+#                               (KEY=VALUE per line, # comments ok) with
+#                               extra env vars your command needs -- e.g.
+#                               a third-party CLI's own API token. Staged
+#                               and exported the same way as the Claude
+#                               and GitHub credentials: never written into
+#                               the Smolfile, only exported in the guest
+#                               right before your command runs.
+#   SMOLFILE_EXTRA               optional. Path to a file of additional raw
+#                               Smolfile TOML (new keys/tables only -- e.g.
+#                               extra resource limits or ports). Appended
+#                               after the generated config; redeclaring a key this
+#                               script already sets makes VM creation fail
+#                               rather than silently overriding it.
+#   CLAUDE_CODE_VERSION         optional. Pins and pre-installs this exact
+#                               @anthropic-ai/claude-code version during VM
+#                               setup, so your command can just call
+#                               `claude` directly. Pin deliberately; don't
+#                               leave this unset and rely on an unpinned
+#                               `npx ... claude-code@latest` inside your
+#                               command, since that resolves whatever is
+#                               newest on the registry at run time.
+#
+# Note on arbitrary commands: whatever you put after `--` runs with full
+# access to the mounted Claude credential and whichever repo credential
+# is active. The egress allowlist and VM boundary still apply, but this
+# script does not vet the command itself -- only use it with tools you
+# trust, and scope the GitHub App's permissions as narrowly as the task
+# allows (e.g. Contents: Read & write, nothing else).
+
+set -euo pipefail
+
+# ---------- configuration ----------
+AUTH_DIR="${HOME}/sandbox-auth"
+AUTH_TIMESTAMP_FILE="${AUTH_DIR}/last_auth_epoch"
+# The token lives in its own directory, not as a bare file directly under
+# AUTH_DIR, because smolvm volume mounts are directories only -- see the
+# "volumes" generation below.
+CLAUDE_TOKEN_DIR="${AUTH_DIR}/claude-token"
+AUTH_TOKEN_FILE="${CLAUDE_TOKEN_DIR}/token"
+# claude setup-token issues a 1-year token, so the default re-auth interval
+# is long -- this just needs to run again sometime before it expires.
+REAUTH_DAYS="${CLAUDE_REAUTH_DAYS:-350}"
+REAUTH_SECONDS=$(( REAUTH_DAYS * 86400 ))
+TOKEN_REFRESH_INTERVAL="${TOKEN_REFRESH_INTERVAL_SECONDS:-2700}"
+# raw.githubusercontent.com is for Claude Code's own changelog/release-notes
+# check, not for your repo -- it's a separate host from github.com/api.github.com
+# and is easy to miss, per Anthropic's own network-requirements docs.
+# deb.debian.org is required for the baseline `apt-get update && apt-get
+# install -y git` init step to succeed -- confirmed needed in practice,
+# not just a theoretical dependency.
+DEFAULT_ALLOW_HOSTS=(registry.npmjs.org api.anthropic.com github.com codeload.github.com api.github.com raw.githubusercontent.com deb.debian.org)
+
+# ---------- argument parsing ----------
+print_help() {
+  cat <<'EOF'
+Usage: run-agent-task.sh <repo-url> [options] -- <command> [args...]
+
+Clones <repo-url> into a disposable smolvm microVM, makes a Claude Code
+credential and a repo credential available inside it, runs <command>,
+then tears the VM down.
+
+Options:
+  --gpu           Enable GPU passthrough (virtio-gpu/Venus) for this run.
+                  Only turn this on for sessions that actually render.
+  --keep          Leave the VM running after the command finishes, for
+                  debugging, instead of stopping and removing it.
+  -h, --help      Show this help and exit.
+
+Repo credential -- set one:
+  DEPLOY_TOKEN                  Static git token. Simple; fixed lifetime,
+                                 fine for tasks under about an hour.
+  GH_APP_ID
+  GH_APP_PRIVATE_KEY_PATH       Set all three together to mint a GitHub App
+  GH_APP_INSTALLATION_ID        token, auto-refreshed in the background
+                                 every TOKEN_REFRESH_INTERVAL_SECONDS
+                                 (default 2700s) -- use this for tasks that
+                                 run past an hour and keep pushing commits.
+
+VM customization:
+  IMAGE                 Base OCI image.               default: node:24-slim
+                         (Active LTS as of late 2026 -- bump as LTS moves on)
+  CLAUDE_CODE_VERSION   Pins and pre-installs this exact Claude Code
+                         version during VM setup, so your command can just
+                         call `claude` directly instead of each invocation
+                         naming its own version. Leave unset to pin inline
+                         in your own command instead -- either way, pin
+                         something; don't rely on an unversioned install.
+  SETUP_EXTRA           One extra setup command run after the baseline git
+                         install (chain multiple steps with && yourself).
+  MOUNTS_EXTRA          Extra bind mounts, space-separated entries of the
+                         form "host_path:guest_path[:ro]". Directories
+                         only -- smolvm does not mount single files.
+  ALLOW_HOSTS_EXTRA     Extra egress-allowed hosts, space-separated.
+  NET_BACKEND           e.g. "virtio-net" for a real virtual NIC instead
+                         of the lightweight default -- try this if a
+                         long-lived connection (WebSocket, SSE) isn't
+                         receiving pushed data inside the sandbox.
+  SMOLFILE_EXTRA        Path to a file of additional Smolfile TOML (new
+                         keys/tables only -- e.g. extra resource limits
+                         or ports; redeclaring [network] also fails).
+                         Appended after the generated config; redeclaring
+                         a key this script already sets makes VM creation
+                         fail rather than silently overriding it.
+
+Debugging:
+  LOG_FILE              Path inside the guest (e.g. /tmp/agent.log) to send
+                        the command's stdout+stderr to. Read it while the
+                        command runs, from a second terminal:
+                          smolvm machine exec --name <id> -- cat <path>
+  ALLOW_ALL_HOSTS       Set to 1 to drop the egress allowlist entirely for
+                        one run, to test whether the allowlist is the cause
+                        of a failure. Never leave this on.
+  NET_LOG               Set to 1 to log every hostname the command's Node
+                        processes connect to, as "[netlog pid=N] tls host:port"
+                        lines on stderr. Pair with LOG_FILE to collect them.
+
+Other:
+  CLAUDE_REAUTH_DAYS    Days before re-running `claude setup-token` on the
+                        host (opens a browser for OAuth approval).
+                        default: 350 -- the resulting token lasts 1 year.
+
+Examples:
+  export DEPLOY_TOKEN=ghp_xxxxx
+  ./run-agent-task.sh https://github.com/yourorg/yourrepo.git -- \
+      npx @eventmodelers/cli run --modeling
+
+  export GH_APP_ID=123456
+  export GH_APP_PRIVATE_KEY_PATH=~/secrets/my-app.pem
+  export GH_APP_INSTALLATION_ID=789012
+  ./run-agent-task.sh https://github.com/yourorg/yourrepo.git -- \
+      npx -y @anthropic-ai/claude-code@2.0.0 \
+      "Implement the feature in ISSUE.md, committing as you go"
+EOF
+}
+
+if [[ $# -eq 0 ]]; then
+  print_help
+  exit 1
+fi
+case "$1" in
+  -h|--help) print_help; exit 0 ;;
+esac
+
+REPO_URL="$1"
+shift
+
+USE_GPU=false
+KEEP_VM=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --gpu)     USE_GPU=true; shift ;;
+    --keep)    KEEP_VM=true; shift ;;
+    -h|--help) print_help; exit 0 ;;
+    --)        shift; break ;;
+    *) echo "Unknown flag before '--': $1" >&2; echo >&2; print_help >&2; exit 1 ;;
+  esac
+done
+
+CMD=("$@")
+if [[ ${#CMD[@]} -eq 0 ]]; then
+  echo "No command given after '--'" >&2
+  echo >&2
+  print_help >&2
+  exit 1
+fi
+
+# ---------- decide which repo-credential mode we're in ----------
+USE_GH_APP=false
+if [[ -n "${GH_APP_ID:-}" || -n "${GH_APP_PRIVATE_KEY_PATH:-}" || -n "${GH_APP_INSTALLATION_ID:-}" ]]; then
+  : "${GH_APP_ID:?GH_APP_ID, GH_APP_PRIVATE_KEY_PATH, and GH_APP_INSTALLATION_ID must all be set together}"
+  : "${GH_APP_PRIVATE_KEY_PATH:?GH_APP_ID, GH_APP_PRIVATE_KEY_PATH, and GH_APP_INSTALLATION_ID must all be set together}"
+  : "${GH_APP_INSTALLATION_ID:?GH_APP_ID, GH_APP_PRIVATE_KEY_PATH, and GH_APP_INSTALLATION_ID must all be set together}"
+  [[ -s "$GH_APP_PRIVATE_KEY_PATH" ]] || { echo "GH_APP_PRIVATE_KEY_PATH does not point to a readable file" >&2; exit 1; }
+  USE_GH_APP=true
+else
+  : "${DEPLOY_TOKEN:?Set DEPLOY_TOKEN, or set GH_APP_ID/GH_APP_PRIVATE_KEY_PATH/GH_APP_INSTALLATION_ID for a refreshing token}"
+fi
+
+command -v smolvm >/dev/null 2>&1 || { echo "smolvm not found on PATH" >&2; exit 1; }
+command -v claude  >/dev/null 2>&1 || { echo "claude CLI not found on PATH (needed for host-side login)" >&2; exit 1; }
+if $USE_GH_APP; then
+  command -v openssl >/dev/null 2>&1 || { echo "openssl is required for GitHub App JWT signing" >&2; exit 1; }
+  command -v jq      >/dev/null 2>&1 || { echo "jq is required to parse the GitHub App token response" >&2; exit 1; }
+fi
+
+mkdir -p "$AUTH_DIR" "$CLAUDE_TOKEN_DIR"
+chmod 700 "$AUTH_DIR" "$CLAUDE_TOKEN_DIR"
+
+WORKDIR=$(mktemp -d)
+TASK_ID=""
+REFRESHER_PID=""
+
+cleanup() {
+  if [[ -n "$REFRESHER_PID" ]]; then
+    echo "== Stopping token refresher (pid $REFRESHER_PID) =="
+    kill "$REFRESHER_PID" 2>/dev/null || true
+    wait "$REFRESHER_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$TASK_ID" ]]; then
+    if ! $KEEP_VM; then
+      echo "== Tearing down $TASK_ID =="
+      smolvm machine stop --name "$TASK_ID" >/dev/null 2>&1 || true
+      smolvm machine rm   --name "$TASK_ID" >/dev/null 2>&1 || true
+    else
+      echo "== --keep set: leaving $TASK_ID running for inspection =="
+    fi
+  fi
+  rm -rf "$WORKDIR"
+}
+trap cleanup EXIT
+
+# ---------- step 1: re-authenticate Claude Code on schedule ----------
+now_epoch=$(date +%s)
+last_epoch=0
+[[ -f "$AUTH_TIMESTAMP_FILE" ]] && last_epoch=$(cat "$AUTH_TIMESTAMP_FILE")
+
+if (( now_epoch - last_epoch >= REAUTH_SECONDS )) || [[ ! -s "$AUTH_TOKEN_FILE" ]]; then
+  echo "== Token missing or older than ${REAUTH_DAYS}d -- running 'claude setup-token' on host =="
+  echo "   A browser window will open for OAuth approval. The resulting token is"
+  echo "   captured automatically below; you don't need to copy/paste anything."
+  SETUP_OUTPUT=$(claude setup-token)
+  echo "$SETUP_OUTPUT"
+  NEW_TOKEN=$(printf '%s' "$SETUP_OUTPUT" | grep -oE 'sk-ant-oat01-[A-Za-z0-9_-]+' | head -n1)
+  [[ -n "$NEW_TOKEN" ]] || { echo "Could not find a token in 'claude setup-token' output -- check it completed successfully" >&2; exit 1; }
+  printf '%s' "$NEW_TOKEN" > "$AUTH_TOKEN_FILE"
+  chmod 600 "$AUTH_TOKEN_FILE"
+  echo "$now_epoch" > "$AUTH_TIMESTAMP_FILE"
+else
+  days_left=$(( (REAUTH_SECONDS - (now_epoch - last_epoch)) / 86400 ))
+  echo "== Reusing existing Claude OAuth token (re-auth due in ~${days_left}d) =="
+fi
+
+# ---------- step 2: GitHub App token minting + background refresher ----------
+mint_github_app_token() {
+  local app_id="$1" private_key="$2" installation_id="$3"
+  local now iat exp header payload unsigned_jwt signature jwt response token
+
+  now=$(date +%s)
+  iat=$((now - 60))
+  exp=$((now + 540))   # GitHub caps app JWTs at 10 minutes
+
+  header=$(printf '{"alg":"RS256","typ":"JWT"}' | base64 | tr -d '=' | tr '/+' '_-' | tr -d '\n')
+  payload=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$iat" "$exp" "$app_id" \
+            | base64 | tr -d '=' | tr '/+' '_-' | tr -d '\n')
+  unsigned_jwt="${header}.${payload}"
+  signature=$(printf '%s' "$unsigned_jwt" \
+              | openssl dgst -sha256 -sign "$private_key" \
+              | base64 | tr -d '=' | tr '/+' '_-' | tr -d '\n')
+  jwt="${unsigned_jwt}.${signature}"
+
+  response=$(curl -sf -X POST \
+    -H "Authorization: Bearer ${jwt}" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/app/installations/${installation_id}/access_tokens") || return 1
+
+  token=$(printf '%s' "$response" | jq -r '.token // empty')
+  [[ -n "$token" ]] || return 1
+  printf '%s' "$token"
+}
+
+if $USE_GH_APP; then
+  TOKEN_DIR="${WORKDIR}/token"
+  mkdir -p "$TOKEN_DIR"
+  chmod 700 "$TOKEN_DIR"
+  TOKEN_FILE="${TOKEN_DIR}/token"
+
+  write_token_atomic() {
+    local tmp="${TOKEN_DIR}/.token.tmp"
+    printf '%s' "$1" > "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$TOKEN_FILE"
+  }
+
+  refresh_token() {
+    local tok
+    tok=$(mint_github_app_token "$GH_APP_ID" "$GH_APP_PRIVATE_KEY_PATH" "$GH_APP_INSTALLATION_ID") || return 1
+    write_token_atomic "$tok"
+  }
+
+  echo "== Minting initial GitHub App installation token =="
+  refresh_token || { echo "Failed to mint an initial GitHub App token" >&2; exit 1; }
+
+  (
+    while true; do
+      sleep "$TOKEN_REFRESH_INTERVAL"
+      if ! refresh_token; then
+        echo "WARN: token refresh failed, retrying in 60s" >&2
+        sleep 60
+        refresh_token || echo "WARN: retry also failed; will try again in ${TOKEN_REFRESH_INTERVAL}s" >&2
+      fi
+    done
+  ) &
+  REFRESHER_PID=$!
+  echo "== Background token refresher started (pid $REFRESHER_PID, every ${TOKEN_REFRESH_INTERVAL}s) =="
+fi
+
+# ---------- step 3: build a per-task Smolfile ----------
+# Real smolvm Smolfile schema (confirmed against the parser's own error
+# output, not assumed): top-level `volumes` (array of "host:guest[:ro]"
+# strings -- directories only, smolvm does not support single-file
+# mounts) and `init` (array of setup commands), plus a separate
+# [network] table holding `allow_hosts`. There is no top-level
+# `allow_host`, `mounts`, or `setup` key.
+TASK_ID="task-$(date +%s)-$RANDOM"
+SMOLFILE="${WORKDIR}/Smolfile"
+IMAGE="${IMAGE:-node:24-slim}"
+
+ALLOW_HOSTS=("${DEFAULT_ALLOW_HOSTS[@]}")
+if [[ -n "${ALLOW_HOSTS_EXTRA:-}" ]]; then
+  # shellcheck disable=SC2206
+  ALLOW_HOSTS+=(${ALLOW_HOSTS_EXTRA})
+fi
+
+# Security-critical mounts always come first and can't be removed or
+# shadowed by MOUNTS_EXTRA -- that var can only append new entries.
+# Each credential lives in its own dedicated directory (not as a bare
+# file) because smolvm volume mounts are directories only.
+MOUNTS=("${CLAUDE_TOKEN_DIR}:/run/claude-token:ro")
+if $USE_GH_APP; then
+  MOUNTS+=("${TOKEN_DIR}:/run/gh-token:ro")
+fi
+
+# TASK_ENV_FILE: arbitrary extra env vars the task command needs (e.g. a
+# third-party CLI's own API token), staged the same way as the other
+# credentials -- never written into the Smolfile text, only exported
+# inside the guest right before the command runs (see step 6). Format is
+# a dotenv-style file: one KEY=VALUE per line, blank lines and lines
+# starting with # are ignored.
+if [[ -n "${TASK_ENV_FILE:-}" ]]; then
+  [[ -f "$TASK_ENV_FILE" ]] || { echo "TASK_ENV_FILE points to a nonexistent file: $TASK_ENV_FILE" >&2; exit 1; }
+  TASK_ENV_DIR="${WORKDIR}/task-env"
+  mkdir -p "$TASK_ENV_DIR"
+  chmod 700 "$TASK_ENV_DIR"
+  cp "$TASK_ENV_FILE" "${TASK_ENV_DIR}/env"
+  chmod 600 "${TASK_ENV_DIR}/env"
+  MOUNTS+=("${TASK_ENV_DIR}:/run/task-env:ro")
+fi
+
+# NET_LOG=1 (debugging): preload a small hook into every Node process the
+# command starts (npx, the tool itself, any Node children) that writes each
+# distinct hostname it connects to on stderr, as "[netlog pid=N] tls host:port".
+# Combine with LOG_FILE to collect them, and with ALLOW_ALL_HOSTS=1 to see
+# hosts the allowlist would otherwise block. Covers fetch, WebSocket, the
+# https module and anything else that goes through tls.connect/dns.lookup.
+if [[ "${NET_LOG:-}" == "1" ]]; then
+  NETLOG_DIR="${WORKDIR}/netlog"
+  mkdir -p "$NETLOG_DIR"
+  cat > "${NETLOG_DIR}/netlog.js" <<'NETLOG_EOF'
+const tls = require('tls'), dns = require('dns');
+const seen = new Set();
+function log(kind, h) {
+  if (!h) return;
+  const k = kind + ' ' + h;
+  if (seen.has(k)) return;
+  seen.add(k);
+  process.stderr.write('[netlog pid=' + process.pid + '] ' + k + '\n');
+}
+const origTls = tls.connect;
+tls.connect = function (...a) {
+  const o = (a[0] && typeof a[0] === 'object') ? a[0] : (a[1] && typeof a[1] === 'object' ? a[1] : {});
+  log('tls', (o.servername || o.host || (typeof a[1] === 'string' ? a[1] : '')) + ':' + (o.port || a[0]));
+  return origTls.apply(this, a);
+};
+const origLookup = dns.lookup;
+dns.lookup = function (host, ...rest) { log('dns', host); return origLookup.call(this, host, ...rest); };
+NETLOG_EOF
+  chmod 755 "$NETLOG_DIR"
+  chmod 644 "${NETLOG_DIR}/netlog.js"
+  MOUNTS+=("${NETLOG_DIR}:/run/netlog:ro")
+fi
+
+if [[ -n "${MOUNTS_EXTRA:-}" ]]; then
+  # Format: space-separated "host_dir:guest_dir[:ro]" entries, e.g.
+  #   MOUNTS_EXTRA="/home/me/.npm-cache:/root/.npm /home/me/data:/data:ro"
+  # Directories only -- smolvm does not support mounting single files.
+  # shellcheck disable=SC2206
+  MOUNTS+=(${MOUNTS_EXTRA})
+fi
+
+# Baseline setup always installs git. If CLAUDE_CODE_VERSION is set, pin
+# and pre-install that exact Claude Code version globally so the task
+# command can just call `claude` directly, instead of each invocation
+# needing its own "npx -y @anthropic-ai/claude-code@x.y.z". Leaving this
+# unset is fine too -- pin the version inline in your own command instead.
+# SETUP_EXTRA appends one more command after that (chain multiple with &&
+# yourself if you need several steps).
+INIT_CMDS=("apt-get update && apt-get install -y git")
+if [[ -n "${CLAUDE_CODE_VERSION:-}" ]]; then
+  # --allow-scripts is scoped to exactly this package by name, not a
+  # blanket opt-in -- recent npm blocks install scripts by default as a
+  # supply-chain hardening measure, and claude-code's postinstall
+  # (install.cjs) is required for it to actually work, not optional.
+  INIT_CMDS+=("npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}")
+fi
+if [[ -n "${SETUP_EXTRA:-}" ]]; then
+  INIT_CMDS+=("$SETUP_EXTRA")
+fi
+
+{
+  echo "image = \"${IMAGE}\""
+  echo 'net = true'
+  echo 'volumes = ['
+  last_idx=$(( ${#MOUNTS[@]} - 1 ))
+  for i in "${!MOUNTS[@]}"; do
+    if [[ $i -eq $last_idx ]]; then
+      echo "  \"${MOUNTS[$i]}\""
+    else
+      echo "  \"${MOUNTS[$i]}\","
+    fi
+  done
+  echo ']'
+  printf 'init = ['
+  last_idx=$(( ${#INIT_CMDS[@]} - 1 ))
+  for i in "${!INIT_CMDS[@]}"; do
+    # Escape backslashes then quotes so each command is a valid TOML string.
+    escaped="${INIT_CMDS[$i]//\\/\\\\}"
+    escaped="${escaped//\"/\\\"}"
+    if [[ $i -eq $last_idx ]]; then
+      printf '"%s"' "$escaped"
+    else
+      printf '"%s", ' "$escaped"
+    fi
+  done
+  printf ']\n'
+  if $USE_GPU; then echo 'gpu = true'; fi
+  # smolvm's default network backend is a lightweight TCP/UDP passthrough
+  # without a real virtual NIC -- fine for short request/response
+  # connections, but worth trying virtio-net if something relying on a
+  # long-lived, idle-until-pushed-to connection (e.g. a WebSocket) isn't
+  # receiving data the way it does outside the sandbox.
+  if [[ -n "${NET_BACKEND:-}" ]]; then
+    echo "net_backend = \"${NET_BACKEND}\""
+  fi
+  # ALLOW_ALL_HOSTS=1 is a debugging toggle: it omits the [network] table
+  # entirely, so the VM has unrestricted egress. Use it to bisect whether
+  # a failure is caused by the allowlist at all -- never as a default.
+  if [[ "${ALLOW_ALL_HOSTS:-}" != "1" ]]; then
+    echo ''
+    echo '[network]'
+    printf 'allow_hosts = ['
+    for h in "${ALLOW_HOSTS[@]}"; do printf '"%s", ' "$h"; done
+    printf ']\n'
+  fi
+} > "$SMOLFILE"
+
+if [[ "${ALLOW_ALL_HOSTS:-}" == "1" ]]; then
+  echo "WARNING: ALLOW_ALL_HOSTS=1 -- egress allowlist DISABLED for this run (debug only)" >&2
+fi
+
+# Anything the script doesn't expose a dedicated knob for -- resource
+# limits, ports, extra env -- can go in a file pointed to by SMOLFILE_EXTRA.
+# Its content is appended as NEW keys/tables only: TOML forbids duplicate
+# keys and duplicate table headers, so trying to redeclare image / net /
+# volumes / init / gpu / [network] here makes `smolvm machine create` fail
+# loudly instead of silently weakening the sandbox config set above.
+if [[ -n "${SMOLFILE_EXTRA:-}" ]]; then
+  [[ -f "$SMOLFILE_EXTRA" ]] || { echo "SMOLFILE_EXTRA points to a nonexistent file: $SMOLFILE_EXTRA" >&2; exit 1; }
+  {
+    echo ""
+    echo "# ---- appended from SMOLFILE_EXTRA: ${SMOLFILE_EXTRA} ----"
+    cat "$SMOLFILE_EXTRA"
+  } >> "$SMOLFILE"
+fi
+
+# ---------- step 4: launch the VM ----------
+echo "== Creating $TASK_ID =="
+smolvm machine create --name "$TASK_ID" -s "$SMOLFILE"
+smolvm machine start  --name "$TASK_ID"
+
+# ---------- step 5: clone the repo ----------
+REPO_NO_SCHEME="${REPO_URL#https://}"
+echo "== Cloning repo =="
+if $USE_GH_APP; then
+  # Credential helper reads the mounted token file fresh on every git
+  # operation, so pushes made after the background refresher has rotated
+  # the file pick up the new token automatically -- no re-clone needed.
+  smolvm machine exec --name "$TASK_ID" -- sh -c '
+    git config --global credential.helper "!f() { echo username=x-access-token; echo password=\$(cat /run/gh-token/token); }; f" &&
+    git clone https://'"${REPO_NO_SCHEME}"' /work/repo
+  '
+else
+  smolvm machine exec --name "$TASK_ID" -- sh -c "
+    git clone https://x-access-token:${DEPLOY_TOKEN}@${REPO_NO_SCHEME} /work/repo &&
+    cd /work/repo &&
+    git remote set-url origin https://${REPO_NO_SCHEME}
+  "
+fi
+
+# ---------- step 6: run the given command from inside the repo ----------
+# CMD is passed through as a real argv array, not a string, so arbitrary
+# arguments (quotes, flags, spaces) survive intact without needing any
+# escaping gymnastics or risk of shell injection from their contents.
+# CLAUDE_CODE_OAUTH_TOKEN and any TASK_ENV_FILE vars are exported from
+# their mounted files right before running, rather than baked into the
+# Smolfile, so none of it sits in a config file on disk inside the guest.
+# If /run/task-env/env isn't mounted (TASK_ENV_FILE unset), that block is
+# a no-op.
+echo "== Running: ${CMD[*]} =="
+# Claude Code refuses to run with --dangerously-skip-permissions as root
+# (its own hard-coded safety check, no override flag), and smolvm's guest
+# runs everything as root by default. Tools that hard-code that flag when
+# spawning claude (e.g. some agent-loop CLIs) will have the child process
+# exit immediately and silently if the spawning code doesn't also handle
+# a non-zero exit -- which looks exactly like a hang. The fix is to run
+# the actual command as a non-root user. RUN_AS_USER defaults to "node",
+# which official Node Docker images ship built in; override it if your
+# IMAGE doesn't have that user.
+#
+# Credential/token files are read here as root, BEFORE dropping
+# privileges, so the non-root user never needs direct read access to the
+# mounted credential directories -- only the resulting env vars, which
+# carry through via setpriv's inherited environment. setpriv execs the
+# real argv array directly (no re-flattening through a shell string), so
+# CMD's arguments survive intact the same way they did running as root.
+RUN_AS_USER="${RUN_AS_USER:-node}"
+
+# LOG_FILE: path INSIDE the guest to write the command's stdout+stderr to.
+# `smolvm machine exec` without a TTY appears to return output only when
+# the command exits, so a long-running process (an agent loop) shows
+# nothing live. Writing to a file lets you read the log from a second
+# terminal while it runs. The path is passed as a positional argument
+# (not spliced into the script text), so it can't break the quoting.
+LOG_FILE="${LOG_FILE:-}"
+if [[ -n "$LOG_FILE" ]]; then
+  echo "== Command output is going to ${LOG_FILE} inside the guest. Read it with:"
+  echo "     smolvm machine exec --name ${TASK_ID} -- cat ${LOG_FILE}"
+fi
+
+smolvm machine exec --name "$TASK_ID" -- sh -c '
+  LOG="$1"; shift
+  export CLAUDE_CODE_OAUTH_TOKEN="$(cat /run/claude-token/token)"
+  export DISABLE_TELEMETRY=1
+  export DO_NOT_TRACK=1
+  if [ -f /run/netlog/netlog.js ]; then
+    export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /run/netlog/netlog.js"
+  fi
+  if [ -f /run/task-env/env ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        ""|"#"*) continue ;;
+      esac
+      export "$line"
+    done < /run/task-env/env
+  fi
+  RUID="$(id -u '"${RUN_AS_USER}"')"
+  RGID="$(id -g '"${RUN_AS_USER}"')"
+  RHOME="$(getent passwd '"${RUN_AS_USER}"' | cut -d: -f6)"
+  # setpriv changes uid/gid but not HOME/USER/LOGNAME -- without this,
+  # npm/npx still resolve their cache under /root (owned by root) and
+  # fail with EACCES once running as a non-root uid.
+  export HOME="$RHOME"
+  export USER='"${RUN_AS_USER}"'
+  export LOGNAME='"${RUN_AS_USER}"'
+  chown -R "$RUID:$RGID" /work/repo
+  cd /work/repo
+  if [ -n "$LOG" ]; then
+    : > "$LOG"
+    chown "$RUID:$RGID" "$LOG"
+    exec setpriv --reuid "$RUID" --regid "$RGID" --init-groups "$@" >> "$LOG" 2>&1
+  fi
+  exec setpriv --reuid "$RUID" --regid "$RGID" --init-groups "$@"
+' sh "$LOG_FILE" "${CMD[@]}"
+
+echo "== Task complete: $TASK_ID =="
