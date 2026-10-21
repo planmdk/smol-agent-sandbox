@@ -29,7 +29,14 @@
 #   6. Tears the VM down and stops the token refresher (unless --keep).
 #
 # Usage:
-#   ./run-agent-task.sh <repo-url> [--gpu] [--keep] -- <command> [args...]
+#   ./run-agent-task.sh [<repo-url>] [--gpu] [--keep] -- <command> [args...]
+#
+# <repo-url> is optional. Without it, the current directory is mounted
+# read-write into the VM at /work/project and the command runs there; no
+# repo credential is needed and the guest sees nothing else from the host.
+#
+# Example (local folder, no repo):
+#   cd ~/my-project && ./run-agent-task.sh -- claude -p "Add tests"
 #
 # Examples (static token, short task):
 #   export DEPLOY_TOKEN=ghp_xxxxx
@@ -143,11 +150,19 @@ DEFAULT_ALLOW_HOSTS=(registry.npmjs.org api.anthropic.com github.com codeload.gi
 # ---------- argument parsing ----------
 print_help() {
   cat <<'EOF'
-Usage: run-agent-task.sh <repo-url> [options] -- <command> [args...]
+Usage: run-agent-task.sh [<repo-url>] [options] -- <command> [args...]
 
-Clones <repo-url> into a disposable smolvm microVM, makes a Claude Code
-credential and a repo credential available inside it, runs <command>,
-then tears the VM down.
+With <repo-url>: clones it into a disposable smolvm microVM, makes a
+Claude Code credential and a repo credential available inside it, runs
+<command>, then tears the VM down.
+
+Without <repo-url> (local mode): mounts the CURRENT DIRECTORY read-write
+into the VM and runs <command> there. The agent can create and modify
+files in that folder, but cannot see anything else on the host. No repo
+credential is needed, and GitHub egress is not allowed by default. Files
+changed in the folder persist on the host after the VM is torn down.
+The script refuses to run from / or from a folder containing
+~/sandbox-auth.
 
 Options:
   --gpu           Enable GPU passthrough (virtio-gpu/Venus) for this run.
@@ -156,7 +171,7 @@ Options:
                   debugging, instead of stopping and removing it.
   -h, --help      Show this help and exit.
 
-Repo credential -- set one:
+Repo credential -- only with <repo-url>; set one:
   DEPLOY_TOKEN                  Static git token. Simple; fixed lifetime,
                                  fine for tasks under about an hour.
   GH_APP_ID
@@ -210,6 +225,10 @@ Other:
                         default: 350 -- the resulting token lasts 1 year.
 
 Examples:
+  # Local mode: sandbox the agent in the current folder
+  cd ~/my-project
+  ./run-agent-task.sh -- claude --dangerously-skip-permissions -p "Add tests"
+
   export DEPLOY_TOKEN=ghp_xxxxx
   ./run-agent-task.sh https://github.com/yourorg/yourrepo.git -- \
       npx @eventmodelers/cli run --modeling
@@ -231,8 +250,14 @@ case "$1" in
   -h|--help) print_help; exit 0 ;;
 esac
 
-REPO_URL="$1"
-shift
+# Optional leading <repo-url>. Without one we run in "local" mode: the
+# current directory is mounted read-write into the VM and nothing else
+# from the host filesystem is visible to the guest.
+REPO_URL=""
+if [[ "$1" != -* ]]; then
+  REPO_URL="$1"
+  shift
+fi
 
 USE_GPU=false
 KEEP_VM=false
@@ -256,7 +281,21 @@ fi
 
 # ---------- decide which repo-credential mode we're in ----------
 USE_GH_APP=false
-if [[ -n "${GH_APP_ID:-}" || -n "${GH_APP_PRIVATE_KEY_PATH:-}" || -n "${GH_APP_INSTALLATION_ID:-}" ]]; then
+LOCAL_MODE=false
+LOCAL_DIR=""
+if [[ -z "$REPO_URL" ]]; then
+  # Local mode: no repo, so no repo credential is needed or provided.
+  LOCAL_MODE=true
+  LOCAL_DIR="$(pwd -P)"
+  # Refuse to mount a directory that would expose the host-side
+  # credentials (or the whole filesystem) to the guest.
+  AUTH_DIR_REAL="$(cd "$HOME" 2>/dev/null && pwd -P)/sandbox-auth"
+  if [[ "$LOCAL_DIR" == "/" || "$AUTH_DIR_REAL" == "$LOCAL_DIR" || "$AUTH_DIR_REAL" == "$LOCAL_DIR"/* ]]; then
+    echo "Refusing to mount '$LOCAL_DIR': it is, or contains, the host credential directory ($AUTH_DIR_REAL)." >&2
+    echo "cd into a project folder instead." >&2
+    exit 1
+  fi
+elif [[ -n "${GH_APP_ID:-}" || -n "${GH_APP_PRIVATE_KEY_PATH:-}" || -n "${GH_APP_INSTALLATION_ID:-}" ]]; then
   : "${GH_APP_ID:?GH_APP_ID, GH_APP_PRIVATE_KEY_PATH, and GH_APP_INSTALLATION_ID must all be set together}"
   : "${GH_APP_PRIVATE_KEY_PATH:?GH_APP_ID, GH_APP_PRIVATE_KEY_PATH, and GH_APP_INSTALLATION_ID must all be set together}"
   : "${GH_APP_INSTALLATION_ID:?GH_APP_ID, GH_APP_PRIVATE_KEY_PATH, and GH_APP_INSTALLATION_ID must all be set together}"
@@ -396,6 +435,11 @@ SMOLFILE="${WORKDIR}/Smolfile"
 IMAGE="${IMAGE:-node:24-slim}"
 
 ALLOW_HOSTS=("${DEFAULT_ALLOW_HOSTS[@]}")
+if $LOCAL_MODE; then
+  # No repo and no repo credential in local mode, so GitHub egress isn't
+  # needed by default (add it back via ALLOW_HOSTS_EXTRA if your task does).
+  ALLOW_HOSTS=(registry.npmjs.org api.anthropic.com raw.githubusercontent.com deb.debian.org)
+fi
 if [[ -n "${ALLOW_HOSTS_EXTRA:-}" ]]; then
   # shellcheck disable=SC2206
   ALLOW_HOSTS+=(${ALLOW_HOSTS_EXTRA})
@@ -406,6 +450,14 @@ fi
 # Each credential lives in its own dedicated directory (not as a bare
 # file) because smolvm volume mounts are directories only.
 MOUNTS=("${CLAUDE_TOKEN_DIR}:/run/claude-token:ro")
+# Where the task runs inside the guest.
+if $LOCAL_MODE; then
+  GUEST_DIR="/work/project"
+  # The only host path the guest can read or write.
+  MOUNTS+=("${LOCAL_DIR}:${GUEST_DIR}")
+else
+  GUEST_DIR="/work/repo"
+fi
 if $USE_GH_APP; then
   MOUNTS+=("${TOKEN_DIR}:/run/gh-token:ro")
 fi
@@ -559,8 +611,10 @@ smolvm machine start  --name "$TASK_ID"
 
 # ---------- step 5: clone the repo ----------
 REPO_NO_SCHEME="${REPO_URL#https://}"
-echo "== Cloning repo =="
-if $USE_GH_APP; then
+if $LOCAL_MODE; then
+  echo "== Local mode: ${LOCAL_DIR} mounted read-write at ${GUEST_DIR} (no clone) =="
+elif $USE_GH_APP; then
+  echo "== Cloning repo =="
   # Credential helper reads the mounted token file fresh on every git
   # operation, so pushes made after the background refresher has rotated
   # the file pick up the new token automatically -- no re-clone needed.
@@ -569,6 +623,7 @@ if $USE_GH_APP; then
     git clone https://'"${REPO_NO_SCHEME}"' /work/repo
   '
 else
+  echo "== Cloning repo =="
   smolvm machine exec --name "$TASK_ID" -- sh -c "
     git clone https://x-access-token:${DEPLOY_TOKEN}@${REPO_NO_SCHEME} /work/repo &&
     cd /work/repo &&
@@ -641,8 +696,17 @@ smolvm machine exec --name "$TASK_ID" -- sh -c '
   export HOME="$RHOME"
   export USER='"${RUN_AS_USER}"'
   export LOGNAME='"${RUN_AS_USER}"'
-  chown -R "$RUID:$RGID" /work/repo
-  cd /work/repo
+  if [ '"${LOCAL_MODE}"' = true ]; then
+    # Bind-mounted host folder: do NOT chown it, that would change
+    # ownership of the host files. Just check the agent can write.
+    if ! setpriv --reuid "$RUID" --regid "$RGID" --init-groups test -w '"${GUEST_DIR}"'; then
+      echo "WARN: user '"${RUN_AS_USER}"' cannot write to '"${GUEST_DIR}"' (uid/gid mismatch with the host folder?)." >&2
+      echo "      Try RUN_AS_USER=root if your command allows it, or fix the folder permissions." >&2
+    fi
+  else
+    chown -R "$RUID:$RGID" '"${GUEST_DIR}"'
+  fi
+  cd '"${GUEST_DIR}"'
   if [ -n "$LOG" ]; then
     : > "$LOG"
     chown "$RUID:$RGID" "$LOG"
