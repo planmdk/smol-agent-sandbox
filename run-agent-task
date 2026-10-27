@@ -528,6 +528,14 @@ fi
 # yourself if you need several steps).
 INIT_CMDS=("apt-get update && apt-get install -y git")
 if [[ -n "${CLAUDE_CODE_VERSION:-}" ]]; then
+  # `claude --version` prints "2.1.123 (Claude Code)"; keep only the first
+  # word so that output can be passed straight in, then validate it so a
+  # malformed value can't end up as shell syntax in the guest init command.
+  CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION%% *}"
+  if [[ ! "$CLAUDE_CODE_VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
+    echo "CLAUDE_CODE_VERSION is not a valid version string: '$CLAUDE_CODE_VERSION'" >&2
+    exit 1
+  fi
   # --allow-scripts is scoped to exactly this package by name, not a
   # blanket opt-in -- recent npm blocks install scripts by default as a
   # supply-chain hardening measure, and claude-code's postinstall
