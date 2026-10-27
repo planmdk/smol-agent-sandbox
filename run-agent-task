@@ -667,11 +667,12 @@ echo "== Running: ${CMD[*]} =="
 # CMD's arguments survive intact the same way they did running as root.
 RUN_AS_USER="${RUN_AS_USER:-node}"
 
-# LOG_FILE: path INSIDE the guest to write the command's stdout+stderr to.
-# `smolvm machine exec` without a TTY appears to return output only when
-# the command exits, so a long-running process (an agent loop) shows
-# nothing live. Writing to a file lets you read the log from a second
-# terminal while it runs. The path is passed as a positional argument
+# Output is streamed live via `smolvm machine exec --stream` (without it,
+# output only appears when the command exits).
+#
+# LOG_FILE (optional): path INSIDE the guest to write the command's
+# stdout+stderr to INSTEAD of the console, e.g. to read it from a second
+# terminal. The path is passed as a positional argument
 # (not spliced into the script text), so it can't break the quoting.
 LOG_FILE="${LOG_FILE:-}"
 if [[ -n "$LOG_FILE" ]]; then
@@ -679,7 +680,7 @@ if [[ -n "$LOG_FILE" ]]; then
   echo "     smolvm machine exec --name ${TASK_ID} -- cat ${LOG_FILE}"
 fi
 
-smolvm machine exec --name "$TASK_ID" -- sh -c '
+smolvm machine exec --name "$TASK_ID" --stream -- sh -c '
   LOG="$1"; shift
   export CLAUDE_CODE_OAUTH_TOKEN="$(cat /run/claude-token/token)"
   export DISABLE_TELEMETRY=1
