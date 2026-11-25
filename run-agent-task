@@ -114,12 +114,6 @@
 #                               guest, via `smolvm machine egress-events`
 #                               polled every 2s. Denials only -- allowed
 #                               traffic isn't logged. Set to 0 to turn off.
-#   NET_LOG                      ON BY DEFAULT. Preloads a hook that logs every
-#                               hostname the command's Node processes connect
-#                               to (stderr, so it lands in LOG_FILE if set).
-#                               Set to 0 to turn it off. Only covers Node
-#                               processes -- not Claude Code itself, which is
-#                               a native binary.
 #   TASK_ENV_FILE                optional. Path to a dotenv-style file
 #                               (KEY=VALUE per line, # comments ok) with
 #                               extra env vars your command needs -- e.g.
@@ -279,11 +273,6 @@ Debugging:
                         refused, as "[egress denied] resolve host" lines on
                         stderr, for every process in the VM. Denials only.
                         Set to 0 to turn it off.
-  NET_LOG               On by default: logs every hostname the command's Node
-                        processes connect to, as "[netlog pid=N] tls host:port"
-                        lines on stderr. Set to 0 to turn it off. Pair with
-                        LOG_FILE to collect them. Does not cover Claude Code
-                        itself (a native binary, not Node).
 
 Other:
   CLAUDE_REAUTH_DAYS    Days before re-running `claude setup-token` on the
@@ -732,39 +721,6 @@ if [[ -n "${TASK_ENV_FILE:-}" ]]; then
   MOUNTS+=("${TASK_ENV_DIR}:/run/task-env:ro")
 fi
 
-# NET_LOG (on unless NET_LOG=0): preload a small hook into every Node process the
-# command starts (npx, the tool itself, any Node children) that writes each
-# distinct hostname it connects to on stderr, as "[netlog pid=N] tls host:port".
-# Combine with LOG_FILE to collect them, and with ALLOW_ALL_HOSTS=1 to see
-# hosts the allowlist would otherwise block. Covers fetch, WebSocket, the
-# https module and anything else that goes through tls.connect/dns.lookup.
-if [[ "${NET_LOG:-1}" != "0" ]]; then
-  NETLOG_DIR="${WORKDIR}/netlog"
-  mkdir -p "$NETLOG_DIR"
-  cat > "${NETLOG_DIR}/netlog.js" <<'NETLOG_EOF'
-const tls = require('tls'), dns = require('dns');
-const seen = new Set();
-function log(kind, h) {
-  if (!h) return;
-  const k = kind + ' ' + h;
-  if (seen.has(k)) return;
-  seen.add(k);
-  process.stderr.write('[netlog pid=' + process.pid + '] ' + k + '\n');
-}
-const origTls = tls.connect;
-tls.connect = function (...a) {
-  const o = (a[0] && typeof a[0] === 'object') ? a[0] : (a[1] && typeof a[1] === 'object' ? a[1] : {});
-  log('tls', (o.servername || o.host || (typeof a[1] === 'string' ? a[1] : '')) + ':' + (o.port || a[0]));
-  return origTls.apply(this, a);
-};
-const origLookup = dns.lookup;
-dns.lookup = function (host, ...rest) { log('dns', host); return origLookup.call(this, host, ...rest); };
-NETLOG_EOF
-  chmod 755 "$NETLOG_DIR"
-  chmod 644 "${NETLOG_DIR}/netlog.js"
-  MOUNTS+=("${NETLOG_DIR}:/run/netlog:ro")
-fi
-
 if [[ -n "${MOUNTS_EXTRA:-}" ]]; then
   # Format: space-separated "host_dir:guest_dir[:ro]" entries, e.g.
   #   MOUNTS_EXTRA="/home/me/.npm-cache:/root/.npm /home/me/data:/data:ro"
@@ -879,9 +835,6 @@ smolvm machine exec --name "$TASK_ID" --stream -- sh -c '
   export CLAUDE_CODE_OAUTH_TOKEN="$(cat /run/claude-token/token)"
   export DISABLE_TELEMETRY=1
   export DO_NOT_TRACK=1
-  if [ -f /run/netlog/netlog.js ]; then
-    export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require /run/netlog/netlog.js"
-  fi
   if [ -f /run/task-env/env ]; then
     while IFS= read -r line || [ -n "$line" ]; do
       case "$line" in
