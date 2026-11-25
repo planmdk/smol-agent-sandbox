@@ -85,9 +85,10 @@
 #   MISE_VERSION                optional. mise release to install; default is
 #                               pinned in this script. Checksum-verified.
 #   SETUP_EXTRA                 optional. One additional shell command run as
-#                               root while building the base pack, after the
-#                               mise tools are installed (chain steps
-#                               yourself with &&).
+#                               root while building the base pack, before the
+#                               mise tools are installed, so mise hooks can
+#                               use what it installs (chain steps yourself
+#                               with &&). The mise tools aren't available yet.
 #   MOUNTS_EXTRA                optional. Extra non-security bind mounts,
 #                               space-separated "host:guest[:ro]" entries.
 #                               Directories only -- smolvm does not support
@@ -242,8 +243,10 @@ VM customization:
                          way, pin something; don't rely on an unversioned
                          install.
   SETUP_EXTRA           One extra setup command run as root while building
-                         the base pack, after the mise tools are installed
-                         (chain multiple steps with && yourself).
+                         the base pack, BEFORE the mise tools are installed,
+                         so mise hooks (e.g. [hooks] postinstall) can use
+                         what it installs. The mise tools aren't available
+                         to it yet. Chain multiple steps with && yourself.
   MOUNTS_EXTRA          Extra bind mounts, space-separated entries of the
                          form "host_path:guest_path[:ro]". Directories
                          only -- smolvm does not mount single files.
@@ -608,6 +611,13 @@ if [ "$CLAUDE_VERSION" != none ]; then
   npm install -g --allow-scripts=@anthropic-ai/claude-code "@anthropic-ai/claude-code@${CLAUDE_VERSION}"
 fi
 
+# SETUP_EXTRA, as root, BEFORE the mise tools so that mise hooks in
+# mise.toml (e.g. [hooks] postinstall) can use whatever it installs.
+if [ -s /build/cfg/extra.sh ]; then
+  cd /
+  sh /build/cfg/extra.sh
+fi
+
 # Project tools, as the run user so they are owned by (and writable for) it.
 if [ -f /build/cfg/mise.toml ]; then
   RUID="$(id -u "$USER_NAME")"; RGID="$(id -g "$USER_NAME")"
@@ -615,11 +625,6 @@ if [ -f /build/cfg/mise.toml ]; then
   cd /build/cfg
   HOME="$RHOME" setpriv --reuid "$RUID" --regid "$RGID" --init-groups \
     sh -c 'mise trust /build/cfg/mise.toml && mise install --yes && mise ls'
-fi
-
-if [ -s /build/cfg/extra.sh ]; then
-  cd /
-  sh /build/cfg/extra.sh
 fi
 SETUP_EOF
 )
