@@ -108,10 +108,12 @@
 #                               allowlist entirely (unrestricted network),
 #                               to test whether a failure is caused by the
 #                               allowlist at all.
-#   NET_LOG                      DEBUG ONLY. Set to 1 to preload a hook that
-#                               logs every hostname the command's Node
-#                               processes connect to (stderr, so it lands in
-#                               LOG_FILE if set).
+#   NET_LOG                      ON BY DEFAULT. Preloads a hook that logs every
+#                               hostname the command's Node processes connect
+#                               to (stderr, so it lands in LOG_FILE if set).
+#                               Set to 0 to turn it off. Only covers Node
+#                               processes -- not Claude Code itself, which is
+#                               a native binary.
 #   TASK_ENV_FILE                optional. Path to a dotenv-style file
 #                               (KEY=VALUE per line, # comments ok) with
 #                               extra env vars your command needs -- e.g.
@@ -267,9 +269,11 @@ Debugging:
   ALLOW_ALL_HOSTS       Set to 1 to drop the egress allowlist entirely for
                         one run, to test whether the allowlist is the cause
                         of a failure. Never leave this on.
-  NET_LOG               Set to 1 to log every hostname the command's Node
+  NET_LOG               On by default: logs every hostname the command's Node
                         processes connect to, as "[netlog pid=N] tls host:port"
-                        lines on stderr. Pair with LOG_FILE to collect them.
+                        lines on stderr. Set to 0 to turn it off. Pair with
+                        LOG_FILE to collect them. Does not cover Claude Code
+                        itself (a native binary, not Node).
 
 Other:
   CLAUDE_REAUTH_DAYS    Days before re-running `claude setup-token` on the
@@ -685,13 +689,13 @@ if [[ -n "${TASK_ENV_FILE:-}" ]]; then
   MOUNTS+=("${TASK_ENV_DIR}:/run/task-env:ro")
 fi
 
-# NET_LOG=1 (debugging): preload a small hook into every Node process the
+# NET_LOG (on unless NET_LOG=0): preload a small hook into every Node process the
 # command starts (npx, the tool itself, any Node children) that writes each
 # distinct hostname it connects to on stderr, as "[netlog pid=N] tls host:port".
 # Combine with LOG_FILE to collect them, and with ALLOW_ALL_HOSTS=1 to see
 # hosts the allowlist would otherwise block. Covers fetch, WebSocket, the
 # https module and anything else that goes through tls.connect/dns.lookup.
-if [[ "${NET_LOG:-}" == "1" ]]; then
+if [[ "${NET_LOG:-1}" != "0" ]]; then
   NETLOG_DIR="${WORKDIR}/netlog"
   mkdir -p "$NETLOG_DIR"
   cat > "${NETLOG_DIR}/netlog.js" <<'NETLOG_EOF'
@@ -866,9 +870,11 @@ smolvm machine exec --name "$TASK_ID" --stream -- sh -c '
   if [ -n "$LOG" ]; then
     : > "$LOG"
     chown "$RUID:$RGID" "$LOG"
-    exec setpriv --reuid "$RUID" --regid "$RGID" --init-groups "$@" >> "$LOG" 2>&1
+    exec setpriv --reuid "$RUID" --regid "$RGID" --init-groups "$@" >> "$LOG" 2>&1 < /dev/null
   fi
-  exec setpriv --reuid "$RUID" --regid "$RGID" --init-groups "$@"
+  # stdin is not forwarded by `machine exec --stream` anyway; closing it
+  # explicitly stops Claude Code waiting 3s for piped input before starting.
+  exec setpriv --reuid "$RUID" --regid "$RGID" --init-groups "$@" < /dev/null
 ' sh "$LOG_FILE" "${CMD[@]}"
 
 echo "== Task complete: $TASK_ID =="
