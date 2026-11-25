@@ -544,7 +544,9 @@ MISE_VERSION="$1"; CLAUDE_VERSION="$2"; USER_NAME="$3"
 export DEBIAN_FRONTEND=noninteractive MISE_QUIET=1 CI=1
 
 apt-get update -qq
-apt-get install -y -qq --no-install-recommends git curl ca-certificates
+# libatomic1: Node.js 26+ binaries link against it and node-slim lacks it
+# (mise's own Debian image installs it for the same reason).
+apt-get install -y -qq --no-install-recommends git curl ca-certificates libatomic1
 rm -rf /var/lib/apt/lists/*
 
 # mise: pinned release binary, verified against the release's checksums.
