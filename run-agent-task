@@ -108,6 +108,12 @@
 #                               allowlist entirely (unrestricted network),
 #                               to test whether a failure is caused by the
 #                               allowlist at all.
+#   EGRESS_LOG                   ON BY DEFAULT. Streams egress attempts the
+#                               allowlist refused ("[egress denied] resolve
+#                               host" on stderr), for every process in the
+#                               guest, via `smolvm machine egress-events`
+#                               polled every 2s. Denials only -- allowed
+#                               traffic isn't logged. Set to 0 to turn off.
 #   NET_LOG                      ON BY DEFAULT. Preloads a hook that logs every
 #                               hostname the command's Node processes connect
 #                               to (stderr, so it lands in LOG_FILE if set).
@@ -269,6 +275,10 @@ Debugging:
   ALLOW_ALL_HOSTS       Set to 1 to drop the egress allowlist entirely for
                         one run, to test whether the allowlist is the cause
                         of a failure. Never leave this on.
+  EGRESS_LOG            On by default: streams egress attempts the allowlist
+                        refused, as "[egress denied] resolve host" lines on
+                        stderr, for every process in the VM. Denials only.
+                        Set to 0 to turn it off.
   NET_LOG               On by default: logs every hostname the command's Node
                         processes connect to, as "[netlog pid=N] tls host:port"
                         lines on stderr. Set to 0 to turn it off. Pair with
@@ -377,12 +387,45 @@ WORKDIR=$(mktemp -d)
 TASK_ID=""
 BUILD_ID=""
 REFRESHER_PID=""
+DENIAL_PID=""
+
+# Prints egress attempts the allowlist refused that haven't been printed
+# yet, as "[egress denied] <op> <destination>" on stderr. This is VM-level
+# (smolvm's own policy), so it covers every process in the guest, not just
+# Node. It only sees DENIED traffic -- allowed connections aren't logged.
+# `egress-events` has no follow mode, so stream_denials polls it.
+print_new_denials() {
+  local seen="${WORKDIR}/denied.seen" line
+  touch "$seen"
+  smolvm machine egress-events --name "$1" --limit 1000 2>/dev/null \
+    | awk 'NR > 1 && NF >= 3 { print $2 " " $3 }' \
+    | sort -u \
+    | while IFS= read -r line; do
+        if ! grep -qxF -- "$line" "$seen"; then
+          printf '%s\n' "$line" >> "$seen"
+          echo "[egress denied] $line" >&2
+        fi
+      done
+}
+stream_denials() {
+  while true; do
+    sleep 2
+    print_new_denials "$1" || true
+  done
+}
 
 cleanup() {
   if [[ -n "$REFRESHER_PID" ]]; then
     echo "== Stopping token refresher (pid $REFRESHER_PID) =="
     kill "$REFRESHER_PID" 2>/dev/null || true
     wait "$REFRESHER_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$DENIAL_PID" ]]; then
+    kill "$DENIAL_PID" 2>/dev/null || true
+    wait "$DENIAL_PID" 2>/dev/null || true
+    # One last pass for anything denied since the final poll, before the
+    # machine (and its event log) goes away.
+    print_new_denials "$TASK_ID" || true
   fi
   if [[ -n "$BUILD_ID" ]]; then
     smolvm machine stop   --name "$BUILD_ID" >/dev/null 2>&1 || true
@@ -760,6 +803,13 @@ fi
 echo "== Creating $TASK_ID from base pack =="
 smolvm machine create "${CREATE_ARGS[@]}"
 smolvm machine start  --name "$TASK_ID"
+
+# EGRESS_LOG (on unless EGRESS_LOG=0): stream refused egress attempts while
+# the command runs. Pointless with ALLOW_ALL_HOSTS=1 (nothing is refused).
+if [[ "${EGRESS_LOG:-1}" != "0" && "${ALLOW_ALL_HOSTS:-}" != "1" ]]; then
+  stream_denials "$TASK_ID" &
+  DENIAL_PID=$!
+fi
 
 # ---------- step 5: clone the repo ----------
 REPO_NO_SCHEME="${REPO_URL#https://}"
