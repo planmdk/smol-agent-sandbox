@@ -862,7 +862,8 @@ smolvm machine exec --name "$TASK_ID" --stream -- sh -c '
   # project'"'"'s versions rather than the image'"'"'s. The mount is the
   # sandbox'"'"'s own project dir, so trust its config instead of making
   # mise prompt (shims fail on an untrusted config).
-  export PATH="$RHOME/.local/share/mise/shims:$PATH"
+  # $RHOME/.local/bin holds user-level installs from mise hooks (e.g. bbin).
+  export PATH="$RHOME/.local/bin:$RHOME/.local/share/mise/shims:$PATH"
   export MISE_TRUSTED_CONFIG_PATHS='"${GUEST_DIR}"'
   if [ '"${LOCAL_MODE}"' = true ]; then
     # Bind-mounted host folder: do NOT chown it, that would change
