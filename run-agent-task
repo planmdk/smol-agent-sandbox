@@ -22,14 +22,20 @@
 #        b) Otherwise: uses a static DEPLOY_TOKEN env var, embedded once
 #           at clone time and stripped from git config immediately after.
 #           Simpler, but fixed-lifetime -- fine for short tasks only.
-#   3. Builds a per-task Smolfile with an egress allowlist and the
-#      relevant read-only mounts.
-#   4. Boots the VM and clones the target repo.
-#   5. Runs whatever command you give it after `--`, from inside the repo.
-#   6. Tears the VM down and stops the token refresher (unless --keep).
+#   3. Ensures a cached "base pack" exists: a smolvm packed machine with
+#      git, a pinned mise, Claude Code (if CLAUDE_CODE_VERSION is set) and
+#      every tool from the project's mise.toml already installed. It is
+#      built once, with unrestricted egress and no credentials mounted,
+#      and reused until its inputs change (or --rebuild).
+#   4. Creates the per-task VM from that pack with an egress allowlist and
+#      the relevant read-only mounts.
+#   5. Boots the VM and clones the target repo.
+#   6. Runs whatever command you give it after `--`, from inside the repo,
+#      with the mise shims on PATH.
+#   7. Tears the VM down and stops the token refresher (unless --keep).
 #
 # Usage:
-#   ./run-agent-task.sh [<repo-url>] [--gpu] [--keep] -- <command> [args...]
+#   ./run-agent-task.sh [<repo-url>] [--gpu] [--keep] [--rebuild] -- <command> [args...]
 #
 # <repo-url> is optional. Without it, the current directory is mounted
 # read-write into the VM at /work/project and the command runs there; no
@@ -62,14 +68,26 @@
 #   CLAUDE_REAUTH_DAYS          optional. Days before re-running `claude
 #                               setup-token` on the host. Default 350,
 #                               since the resulting token lasts 1 year.
-#   ALLOW_HOSTS_EXTRA           optional. Extra space-separated egress
-#                               hosts, e.g. "pypi.org files.pythonhosted.org"
-#   IMAGE                       optional. Base OCI image. Default node:24-slim
-#                               (Active LTS as of late 2026 -- Node 20 is EOL;
-#                               bump this yourself as LTS lines move on).
-#   SETUP_EXTRA                 optional. One additional shell command run
-#                               during VM setup, after the baseline git
-#                               install (chain steps yourself with &&).
+#   ALLOW_HOSTS_EXTRA           optional. Extra space-separated RUN-time egress
+#                               hosts, e.g. "pypi.org files.pythonhosted.org".
+#                               Build-time downloads need no entry: the base
+#                               pack is built with unrestricted egress.
+#   IMAGE                       optional. Base OCI image (Debian-based, with
+#                               node, npm and a non-root user). Default
+#                               node:24-slim (Active LTS as of late 2026 --
+#                               Node 20 is EOL; bump this yourself as LTS
+#                               lines move on).
+#   BASE_MISE_TOML              optional. Path to the mise.toml to bake into
+#                               the base pack. Default: ./mise.toml or
+#                               ./.mise.toml in local mode, none with
+#                               <repo-url> (the repo isn't cloned at build
+#                               time).
+#   MISE_VERSION                optional. mise release to install; default is
+#                               pinned in this script. Checksum-verified.
+#   SETUP_EXTRA                 optional. One additional shell command run as
+#                               root while building the base pack, after the
+#                               mise tools are installed (chain steps
+#                               yourself with &&).
 #   MOUNTS_EXTRA                optional. Extra non-security bind mounts,
 #                               space-separated "host:guest[:ro]" entries.
 #                               Directories only -- smolvm does not support
@@ -100,17 +118,17 @@
 #                               a third-party CLI's own API token. Staged
 #                               and exported the same way as the Claude
 #                               and GitHub credentials: never written into
-#                               the Smolfile, only exported in the guest
+#                               any config, only exported in the guest
 #                               right before your command runs.
-#   SMOLFILE_EXTRA               optional. Path to a file of additional raw
-#                               Smolfile TOML (new keys/tables only -- e.g.
-#                               extra resource limits or ports). Appended
-#                               after the generated config; redeclaring a key this
-#                               script already sets makes VM creation fail
-#                               rather than silently overriding it.
+#   CREATE_ARGS_EXTRA            optional. Extra flags for `smolvm machine
+#                               create`, e.g. "--cpus 2 --mem 4096". A
+#                               packed machine can't be combined with a
+#                               Smolfile, so this replaces SMOLFILE_EXTRA.
+#                               Unlike it, a flag here can override the
+#                               sandbox settings above.
 #   CLAUDE_CODE_VERSION         optional. Pins and pre-installs this exact
-#                               @anthropic-ai/claude-code version during VM
-#                               setup, so your command can just call
+#                               @anthropic-ai/claude-code version into the
+#                               base pack, so your command can just call
 #                               `claude` directly. Pin deliberately; don't
 #                               leave this unset and rely on an unpinned
 #                               `npx ... claude-code@latest` inside your
@@ -131,7 +149,7 @@ AUTH_DIR="${HOME}/sandbox-auth"
 AUTH_TIMESTAMP_FILE="${AUTH_DIR}/last_auth_epoch"
 # The token lives in its own directory, not as a bare file directly under
 # AUTH_DIR, because smolvm volume mounts are directories only -- see the
-# "volumes" generation below.
+# per-task `-v` mounts below.
 CLAUDE_TOKEN_DIR="${AUTH_DIR}/claude-token"
 AUTH_TOKEN_FILE="${CLAUDE_TOKEN_DIR}/token"
 # claude setup-token issues a 1-year token, so the default re-auth interval
@@ -142,10 +160,16 @@ TOKEN_REFRESH_INTERVAL="${TOKEN_REFRESH_INTERVAL_SECONDS:-2700}"
 # raw.githubusercontent.com is for Claude Code's own changelog/release-notes
 # check, not for your repo -- it's a separate host from github.com/api.github.com
 # and is easy to miss, per Anthropic's own network-requirements docs.
-# deb.debian.org is required for the baseline `apt-get update && apt-get
-# install -y git` init step to succeed -- confirmed needed in practice,
-# not just a theoretical dependency.
-DEFAULT_ALLOW_HOSTS=(registry.npmjs.org api.anthropic.com github.com codeload.github.com api.github.com raw.githubusercontent.com deb.debian.org)
+# This is the RUN-time allowlist only. Everything that needs the network
+# to install (apt, the mise release download, tool downloads, npm) happens
+# once, while the base pack is built, with unrestricted egress and no
+# credentials mounted -- see ensure_base_pack below.
+DEFAULT_ALLOW_HOSTS=(registry.npmjs.org api.anthropic.com github.com codeload.github.com api.github.com raw.githubusercontent.com)
+
+# Base packs (see ensure_base_pack) are cached here, one per config hash.
+PACK_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/smol-agent-sandbox/packs"
+# Pinned deliberately, like CLAUDE_CODE_VERSION. Override with MISE_VERSION.
+DEFAULT_MISE_VERSION="2026.11.14"
 
 # ---------- argument parsing ----------
 print_help() {
@@ -169,6 +193,7 @@ Options:
                   Only turn this on for sessions that actually render.
   --keep          Leave the VM running after the command finishes, for
                   debugging, instead of stopping and removing it.
+  --rebuild       Rebuild the cached base pack (see below) first.
   -h, --help      Show this help and exit.
 
 Repo credential -- only with <repo-url>; set one:
@@ -181,31 +206,58 @@ Repo credential -- only with <repo-url>; set one:
                                  (default 2700s) -- use this for tasks that
                                  run past an hour and keep pushing commits.
 
+Base pack (built once, reused by every run with the same inputs):
+  The first run builds a packed base machine with UNRESTRICTED egress and
+  no credentials mounted: apt git/curl, a pinned mise, Claude Code (if
+  CLAUDE_CODE_VERSION is set) and every tool from the project's mise.toml,
+  installed as RUN_AS_USER. Later runs start from that pack with only the
+  allowlist below. Packs are cached in
+  ${XDG_CACHE_HOME:-~/.cache}/smol-agent-sandbox/packs (about 0.5 GiB each).
+  The key is a hash of IMAGE, MISE_VERSION, CLAUDE_CODE_VERSION, RUN_AS_USER,
+  SETUP_EXTRA and the mise.toml content, so editing any of them rebuilds.
+  Fuzzy versions ("latest", "22") are resolved at build time; use
+  --rebuild to refresh them.
+  Local mode bakes ./mise.toml (or ./.mise.toml). With <repo-url> there is
+  no project file at build time, so set BASE_MISE_TOML to bake one.
+
+  --rebuild             Rebuild the base pack even if a cached one exists.
+  BASE_MISE_TOML        Path to the mise.toml to bake. Default: ./mise.toml
+                         in local mode, none with <repo-url>.
+  MISE_VERSION          mise release to install, e.g. 2026.11.14. Default
+                         is pinned in the script (DEFAULT_MISE_VERSION).
+                         Checksum-verified against the release's
+                         SHASUMS256.txt during the build.
+
 VM customization:
-  IMAGE                 Base OCI image.               default: node:24-slim
+  IMAGE                 Base OCI image (Debian-based with node, npm and a
+                         non-root user).              default: node:24-slim
                          (Active LTS as of late 2026 -- bump as LTS moves on)
   CLAUDE_CODE_VERSION   Pins and pre-installs this exact Claude Code
-                         version during VM setup, so your command can just
-                         call `claude` directly instead of each invocation
-                         naming its own version. Leave unset to pin inline
-                         in your own command instead -- either way, pin
-                         something; don't rely on an unversioned install.
-  SETUP_EXTRA           One extra setup command run after the baseline git
-                         install (chain multiple steps with && yourself).
+                         version into the base pack, so your command can
+                         just call `claude` directly instead of each
+                         invocation naming its own version. Leave unset to
+                         pin inline in your own command instead -- either
+                         way, pin something; don't rely on an unversioned
+                         install.
+  SETUP_EXTRA           One extra setup command run as root while building
+                         the base pack, after the mise tools are installed
+                         (chain multiple steps with && yourself).
   MOUNTS_EXTRA          Extra bind mounts, space-separated entries of the
                          form "host_path:guest_path[:ro]". Directories
                          only -- smolvm does not mount single files.
-  ALLOW_HOSTS_EXTRA     Extra egress-allowed hosts, space-separated.
+  ALLOW_HOSTS_EXTRA     Extra RUN-time egress-allowed hosts,
+                         space-separated. Build-time downloads need no
+                         entry here.
   NET_BACKEND           e.g. "virtio-net" for a real virtual NIC instead
                          of the lightweight default -- try this if a
                          long-lived connection (WebSocket, SSE) isn't
                          receiving pushed data inside the sandbox.
-  SMOLFILE_EXTRA        Path to a file of additional Smolfile TOML (new
-                         keys/tables only -- e.g. extra resource limits
-                         or ports; redeclaring [network] also fails).
-                         Appended after the generated config; redeclaring
-                         a key this script already sets makes VM creation
-                         fail rather than silently overriding it.
+  CREATE_ARGS_EXTRA     Extra flags appended to `smolvm machine create`,
+                         e.g. "--cpus 2 --mem 4096". Unlike the old
+                         SMOLFILE_EXTRA, a flag here CAN override the
+                         sandbox settings above (a Smolfile cannot be
+                         combined with a packed machine), so only put
+                         flags you mean in it.
 
 Debugging:
   LOG_FILE              Path inside the guest (e.g. /tmp/agent.log) to send
@@ -261,10 +313,12 @@ fi
 
 USE_GPU=false
 KEEP_VM=false
+REBUILD=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --gpu)     USE_GPU=true; shift ;;
     --keep)    KEEP_VM=true; shift ;;
+    --rebuild) REBUILD=true; shift ;;
     -h|--help) print_help; exit 0 ;;
     --)        shift; break ;;
     *) echo "Unknown flag before '--': $1" >&2; echo >&2; print_help >&2; exit 1 ;;
@@ -317,6 +371,7 @@ chmod 700 "$AUTH_DIR" "$CLAUDE_TOKEN_DIR"
 
 WORKDIR=$(mktemp -d)
 TASK_ID=""
+BUILD_ID=""
 REFRESHER_PID=""
 
 cleanup() {
@@ -325,11 +380,17 @@ cleanup() {
     kill "$REFRESHER_PID" 2>/dev/null || true
     wait "$REFRESHER_PID" 2>/dev/null || true
   fi
+  if [[ -n "$BUILD_ID" ]]; then
+    smolvm machine stop   --name "$BUILD_ID" >/dev/null 2>&1 || true
+    smolvm machine delete --name "$BUILD_ID" --force >/dev/null 2>&1 || true
+  fi
   if [[ -n "$TASK_ID" ]]; then
     if ! $KEEP_VM; then
       echo "== Tearing down $TASK_ID =="
-      smolvm machine stop --name "$TASK_ID" >/dev/null 2>&1 || true
-      smolvm machine rm   --name "$TASK_ID" >/dev/null 2>&1 || true
+      smolvm machine stop   --name "$TASK_ID" >/dev/null 2>&1 || true
+      # --force: without it `delete` asks for confirmation, fails when stdin
+      # isn't a terminal, and (hidden by the redirect) leaks the machine.
+      smolvm machine delete --name "$TASK_ID" --force >/dev/null 2>&1 || true
     else
       echo "== --keep set: leaving $TASK_ID running for inspection =="
     fi
@@ -423,22 +484,166 @@ if $USE_GH_APP; then
   echo "== Background token refresher started (pid $REFRESHER_PID, every ${TOKEN_REFRESH_INTERVAL}s) =="
 fi
 
-# ---------- step 3: build a per-task Smolfile ----------
-# Real smolvm Smolfile schema (confirmed against the parser's own error
-# output, not assumed): top-level `volumes` (array of "host:guest[:ro]"
-# strings -- directories only, smolvm does not support single-file
-# mounts) and `init` (array of setup commands), plus a separate
-# [network] table holding `allow_hosts`. There is no top-level
-# `allow_host`, `mounts`, or `setup` key.
-TASK_ID="task-$(date +%s)-$RANDOM"
-SMOLFILE="${WORKDIR}/Smolfile"
+# ---------- step 3: ensure the base pack exists ----------
+# The base pack is a smolvm packed machine (`smolvm pack create --from-vm`)
+# holding everything that needs the network to install: git, mise, Claude
+# Code and the project's mise.toml tools. It is built once with
+# unrestricted egress, then every run creates its machine from it
+# (`machine create --from`), so runs boot in well under a second and only
+# need the slim allowlist. Nothing credential-like is mounted while it is
+# built: the build VM sees only a read-only copy of mise.toml and the
+# setup script.
+#
+# The build runs inside the Smolfile's `init` (once, on first start), as
+# root; the mise install itself drops to RUN_AS_USER so the tools end up
+# owned by the user the task runs as.
 IMAGE="${IMAGE:-node:24-slim}"
+RUN_AS_USER="${RUN_AS_USER:-node}"
+MISE_VERSION="${MISE_VERSION:-$DEFAULT_MISE_VERSION}"
+
+# These end up inside a guest shell command, so validate them first.
+if [[ ! "$MISE_VERSION" =~ ^[0-9][0-9A-Za-z._-]*$ ]]; then
+  echo "MISE_VERSION is not a valid version string: '$MISE_VERSION'" >&2
+  exit 1
+fi
+if [[ ! "$RUN_AS_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+  echo "RUN_AS_USER is not a valid user name: '$RUN_AS_USER'" >&2
+  exit 1
+fi
+if [[ -n "${CLAUDE_CODE_VERSION:-}" ]]; then
+  # `claude --version` prints "2.1.123 (Claude Code)"; keep only the first
+  # word so that output can be passed straight in.
+  CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION%% *}"
+  if [[ ! "$CLAUDE_CODE_VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
+    echo "CLAUDE_CODE_VERSION is not a valid version string: '$CLAUDE_CODE_VERSION'" >&2
+    exit 1
+  fi
+fi
+
+# Which mise.toml to bake: explicit BASE_MISE_TOML, else ./mise.toml or
+# ./.mise.toml in local mode, else none (a repo isn't cloned yet).
+BASE_TOML="${BASE_MISE_TOML:-}"
+if [[ -z "$BASE_TOML" ]] && $LOCAL_MODE; then
+  for candidate in mise.toml .mise.toml; do
+    if [[ -f "${LOCAL_DIR}/${candidate}" ]]; then
+      BASE_TOML="${LOCAL_DIR}/${candidate}"
+      break
+    fi
+  done
+fi
+if [[ -n "$BASE_TOML" && ! -f "$BASE_TOML" ]]; then
+  echo "BASE_MISE_TOML points to a nonexistent file: $BASE_TOML" >&2
+  exit 1
+fi
+
+# Runs in the guest as root. Arguments: mise version, Claude Code version
+# ("none" to skip), and the user to install the mise tools as.
+BASE_SETUP_SH=$(cat <<'SETUP_EOF'
+set -eu
+MISE_VERSION="$1"; CLAUDE_VERSION="$2"; USER_NAME="$3"
+export DEBIAN_FRONTEND=noninteractive MISE_QUIET=1 CI=1
+
+apt-get update -qq
+apt-get install -y -qq --no-install-recommends git curl ca-certificates
+rm -rf /var/lib/apt/lists/*
+
+# mise: pinned release binary, verified against the release's checksums.
+case "$(uname -m)" in
+  x86_64)        ARCH=x64 ;;
+  aarch64|arm64) ARCH=arm64 ;;
+  *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+FILE="mise-v${MISE_VERSION}-linux-${ARCH}"
+BASE_URL="https://github.com/jdx/mise/releases/download/v${MISE_VERSION}"
+cd /tmp
+curl -fsSLO "${BASE_URL}/${FILE}"
+curl -fsSLO "${BASE_URL}/SHASUMS256.txt"
+grep " \./${FILE}\$" SHASUMS256.txt | sha256sum -c -
+install -m 755 "$FILE" /usr/local/bin/mise
+rm -f "$FILE" SHASUMS256.txt
+
+# --allow-scripts is scoped to exactly this package by name, not a
+# blanket opt-in -- recent npm blocks install scripts by default as a
+# supply-chain hardening measure, and claude-code's postinstall
+# (install.cjs) is required for it to actually work, not optional.
+if [ "$CLAUDE_VERSION" != none ]; then
+  npm install -g --allow-scripts=@anthropic-ai/claude-code "@anthropic-ai/claude-code@${CLAUDE_VERSION}"
+fi
+
+# Project tools, as the run user so they are owned by (and writable for) it.
+if [ -f /build/cfg/mise.toml ]; then
+  RUID="$(id -u "$USER_NAME")"; RGID="$(id -g "$USER_NAME")"
+  RHOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
+  cd /build/cfg
+  HOME="$RHOME" setpriv --reuid "$RUID" --regid "$RGID" --init-groups \
+    sh -c 'mise trust /build/cfg/mise.toml && mise install --yes && mise ls'
+fi
+
+if [ -s /build/cfg/extra.sh ]; then
+  cd /
+  sh /build/cfg/extra.sh
+fi
+SETUP_EOF
+)
+
+ensure_base_pack() {
+  local key
+  key=$(
+    {
+      printf '%s\n' "$IMAGE" "$MISE_VERSION" "${CLAUDE_CODE_VERSION:-}" \
+        "$RUN_AS_USER" "${SETUP_EXTRA:-}" "$BASE_SETUP_SH"
+      if [[ -n "$BASE_TOML" ]]; then cat "$BASE_TOML"; fi
+    } | sha256sum | cut -c1-16
+  )
+  BASE_PACK="${PACK_DIR}/${key}.smolmachine"
+
+  if [[ -f "$BASE_PACK" ]] && ! $REBUILD; then
+    echo "== Reusing base pack ${key} =="
+    return 0
+  fi
+
+  echo "== Building base pack ${key} (unrestricted egress, no credentials mounted) =="
+  [[ -n "$BASE_TOML" ]] && echo "   baking tools from ${BASE_TOML}"
+  mkdir -p "$PACK_DIR"
+  local build_dir="${WORKDIR}/build" out_dir="${WORKDIR}/pack"
+  mkdir -p "$build_dir" "$out_dir"
+  chmod 755 "$build_dir"
+  printf '%s\n' "$BASE_SETUP_SH" > "${build_dir}/setup.sh"
+  printf '%s\n' "${SETUP_EXTRA:-}" > "${build_dir}/extra.sh"
+  [[ -n "$BASE_TOML" ]] && cp "$BASE_TOML" "${build_dir}/mise.toml"
+  chmod 644 "${build_dir}"/*
+
+  cat > "${WORKDIR}/build.smolfile" <<EOF
+image = "${IMAGE}"
+net = true
+volumes = ["${build_dir}:/build/cfg:ro"]
+init = ["sh /build/cfg/setup.sh '${MISE_VERSION}' '${CLAUDE_CODE_VERSION:-none}' '${RUN_AS_USER}'"]
+EOF
+
+  BUILD_ID="base-${key}-$$"
+  smolvm machine create --name "$BUILD_ID" -s "${WORKDIR}/build.smolfile"
+  smolvm machine start  --name "$BUILD_ID"   # init (the whole install) runs here
+  smolvm machine stop   --name "$BUILD_ID"
+  smolvm pack create --from-vm "$BUILD_ID" -o "${out_dir}/base"
+  # Only the sidecar is needed: `machine create --from` reads it directly.
+  # mv within the same filesystem so a half-written pack is never visible.
+  mv -f "${out_dir}/base.smolmachine" "${BASE_PACK}.tmp.$$"
+  mv -f "${BASE_PACK}.tmp.$$" "$BASE_PACK"
+  smolvm machine delete --name "$BUILD_ID" --force >/dev/null
+  BUILD_ID=""
+}
+ensure_base_pack
+
+# ---------- step 4: create the per-task machine from the pack ----------
+# `machine create --from <pack>` can't be combined with a Smolfile, so the
+# run-time config (mounts, allowlist, ...) is passed as flags instead.
+TASK_ID="task-$(date +%s)-$RANDOM"
 
 ALLOW_HOSTS=("${DEFAULT_ALLOW_HOSTS[@]}")
 if $LOCAL_MODE; then
   # No repo and no repo credential in local mode, so GitHub egress isn't
   # needed by default (add it back via ALLOW_HOSTS_EXTRA if your task does).
-  ALLOW_HOSTS=(registry.npmjs.org api.anthropic.com raw.githubusercontent.com deb.debian.org)
+  ALLOW_HOSTS=(registry.npmjs.org api.anthropic.com raw.githubusercontent.com)
 fi
 if [[ -n "${ALLOW_HOSTS_EXTRA:-}" ]]; then
   # shellcheck disable=SC2206
@@ -519,102 +724,35 @@ if [[ -n "${MOUNTS_EXTRA:-}" ]]; then
   MOUNTS+=(${MOUNTS_EXTRA})
 fi
 
-# Baseline setup always installs git. If CLAUDE_CODE_VERSION is set, pin
-# and pre-install that exact Claude Code version globally so the task
-# command can just call `claude` directly, instead of each invocation
-# needing its own "npx -y @anthropic-ai/claude-code@x.y.z". Leaving this
-# unset is fine too -- pin the version inline in your own command instead.
-# SETUP_EXTRA appends one more command after that (chain multiple with &&
-# yourself if you need several steps).
-INIT_CMDS=("apt-get update && apt-get install -y git")
-if [[ -n "${CLAUDE_CODE_VERSION:-}" ]]; then
-  # `claude --version` prints "2.1.123 (Claude Code)"; keep only the first
-  # word so that output can be passed straight in, then validate it so a
-  # malformed value can't end up as shell syntax in the guest init command.
-  CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION%% *}"
-  if [[ ! "$CLAUDE_CODE_VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
-    echo "CLAUDE_CODE_VERSION is not a valid version string: '$CLAUDE_CODE_VERSION'" >&2
-    exit 1
-  fi
-  # --allow-scripts is scoped to exactly this package by name, not a
-  # blanket opt-in -- recent npm blocks install scripts by default as a
-  # supply-chain hardening measure, and claude-code's postinstall
-  # (install.cjs) is required for it to actually work, not optional.
-  INIT_CMDS+=("npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}")
+CREATE_ARGS=(--name "$TASK_ID" --from "$BASE_PACK")
+for m in "${MOUNTS[@]}"; do
+  CREATE_ARGS+=(-v "$m")
+done
+if $USE_GPU; then CREATE_ARGS+=(--gpu); fi
+# smolvm's default network backend is a lightweight TCP/UDP passthrough
+# without a real virtual NIC -- fine for short request/response
+# connections, but worth trying virtio-net if something relying on a
+# long-lived, idle-until-pushed-to connection (e.g. a WebSocket) isn't
+# receiving data the way it does outside the sandbox.
+if [[ -n "${NET_BACKEND:-}" ]]; then
+  CREATE_ARGS+=(--net-backend "$NET_BACKEND")
 fi
-if [[ -n "${SETUP_EXTRA:-}" ]]; then
-  INIT_CMDS+=("$SETUP_EXTRA")
-fi
-
-{
-  echo "image = \"${IMAGE}\""
-  echo 'net = true'
-  echo 'volumes = ['
-  last_idx=$(( ${#MOUNTS[@]} - 1 ))
-  for i in "${!MOUNTS[@]}"; do
-    if [[ $i -eq $last_idx ]]; then
-      echo "  \"${MOUNTS[$i]}\""
-    else
-      echo "  \"${MOUNTS[$i]}\","
-    fi
-  done
-  echo ']'
-  printf 'init = ['
-  last_idx=$(( ${#INIT_CMDS[@]} - 1 ))
-  for i in "${!INIT_CMDS[@]}"; do
-    # Escape backslashes then quotes so each command is a valid TOML string.
-    escaped="${INIT_CMDS[$i]//\\/\\\\}"
-    escaped="${escaped//\"/\\\"}"
-    if [[ $i -eq $last_idx ]]; then
-      printf '"%s"' "$escaped"
-    else
-      printf '"%s", ' "$escaped"
-    fi
-  done
-  printf ']\n'
-  if $USE_GPU; then echo 'gpu = true'; fi
-  # smolvm's default network backend is a lightweight TCP/UDP passthrough
-  # without a real virtual NIC -- fine for short request/response
-  # connections, but worth trying virtio-net if something relying on a
-  # long-lived, idle-until-pushed-to connection (e.g. a WebSocket) isn't
-  # receiving data the way it does outside the sandbox.
-  if [[ -n "${NET_BACKEND:-}" ]]; then
-    echo "net_backend = \"${NET_BACKEND}\""
-  fi
-  # ALLOW_ALL_HOSTS=1 is a debugging toggle: it omits the [network] table
-  # entirely, so the VM has unrestricted egress. Use it to bisect whether
-  # a failure is caused by the allowlist at all -- never as a default.
-  if [[ "${ALLOW_ALL_HOSTS:-}" != "1" ]]; then
-    echo ''
-    echo '[network]'
-    printf 'allow_hosts = ['
-    for h in "${ALLOW_HOSTS[@]}"; do printf '"%s", ' "$h"; done
-    printf ']\n'
-  fi
-} > "$SMOLFILE"
-
+# ALLOW_ALL_HOSTS=1 is a debugging toggle: plain --net, no allowlist, so
+# the VM has unrestricted egress. Use it to bisect whether a failure is
+# caused by the allowlist at all -- never as a default.
 if [[ "${ALLOW_ALL_HOSTS:-}" == "1" ]]; then
   echo "WARNING: ALLOW_ALL_HOSTS=1 -- egress allowlist DISABLED for this run (debug only)" >&2
+  CREATE_ARGS+=(--net)
+else
+  for h in "${ALLOW_HOSTS[@]}"; do CREATE_ARGS+=(--allow-host "$h"); done
+fi
+if [[ -n "${CREATE_ARGS_EXTRA:-}" ]]; then
+  # shellcheck disable=SC2206
+  CREATE_ARGS+=(${CREATE_ARGS_EXTRA})
 fi
 
-# Anything the script doesn't expose a dedicated knob for -- resource
-# limits, ports, extra env -- can go in a file pointed to by SMOLFILE_EXTRA.
-# Its content is appended as NEW keys/tables only: TOML forbids duplicate
-# keys and duplicate table headers, so trying to redeclare image / net /
-# volumes / init / gpu / [network] here makes `smolvm machine create` fail
-# loudly instead of silently weakening the sandbox config set above.
-if [[ -n "${SMOLFILE_EXTRA:-}" ]]; then
-  [[ -f "$SMOLFILE_EXTRA" ]] || { echo "SMOLFILE_EXTRA points to a nonexistent file: $SMOLFILE_EXTRA" >&2; exit 1; }
-  {
-    echo ""
-    echo "# ---- appended from SMOLFILE_EXTRA: ${SMOLFILE_EXTRA} ----"
-    cat "$SMOLFILE_EXTRA"
-  } >> "$SMOLFILE"
-fi
-
-# ---------- step 4: launch the VM ----------
-echo "== Creating $TASK_ID =="
-smolvm machine create --name "$TASK_ID" -s "$SMOLFILE"
+echo "== Creating $TASK_ID from base pack =="
+smolvm machine create "${CREATE_ARGS[@]}"
 smolvm machine start  --name "$TASK_ID"
 
 # ---------- step 5: clone the repo ----------
@@ -705,6 +843,13 @@ smolvm machine exec --name "$TASK_ID" --stream -- sh -c '
   export HOME="$RHOME"
   export USER='"${RUN_AS_USER}"'
   export LOGNAME='"${RUN_AS_USER}"'
+  # The tools baked from mise.toml live under the run user'"'"'s mise data
+  # dir; shims first on PATH make `node`, `jq`, ... resolve to the
+  # project'"'"'s versions rather than the image'"'"'s. The mount is the
+  # sandbox'"'"'s own project dir, so trust its config instead of making
+  # mise prompt (shims fail on an untrusted config).
+  export PATH="$RHOME/.local/share/mise/shims:$PATH"
+  export MISE_TRUSTED_CONFIG_PATHS='"${GUEST_DIR}"'
   if [ '"${LOCAL_MODE}"' = true ]; then
     # Bind-mounted host folder: do NOT chown it, that would change
     # ownership of the host files. Just check the agent can write.
