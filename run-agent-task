@@ -79,9 +79,8 @@
 #                               lines move on).
 #   BASE_MISE_TOML              optional. Path to the mise.toml to bake into
 #                               the base pack. Default: ./mise.toml or
-#                               ./.mise.toml in local mode, none with
-#                               <repo-url> (the repo isn't cloned at build
-#                               time).
+#                               ./.mise.toml in local mode, the repo's own
+#                               (read on the host) with <repo-url>.
 #   MISE_VERSION                optional. mise release to install; default is
 #                               pinned in this script. Checksum-verified.
 #   SETUP_EXTRA                 optional. One additional shell command run as
@@ -220,12 +219,14 @@ Base pack (built once, reused by every run with the same inputs):
   SETUP_EXTRA and the mise.toml content, so editing any of them rebuilds.
   Fuzzy versions ("latest", "22") are resolved at build time; use
   --rebuild to refresh them.
-  Local mode bakes ./mise.toml (or ./.mise.toml). With <repo-url> there is
-  no project file at build time, so set BASE_MISE_TOML to bake one.
+  Local mode bakes ./mise.toml (or ./.mise.toml). With <repo-url> the host
+  reads mise.toml (or .mise.toml) from the repo's default branch with the
+  same credential as the clone (a shallow, blob-less clone; the token never
+  enters the build VM). Set BASE_MISE_TOML to bake a different file.
 
   --rebuild             Rebuild the base pack even if a cached one exists.
   BASE_MISE_TOML        Path to the mise.toml to bake. Default: ./mise.toml
-                         in local mode, none with <repo-url>.
+                         in local mode, the repo's own with <repo-url>.
   MISE_VERSION          mise release to install, e.g. 2026.11.14. Default
                          is pinned in the script (DEFAULT_MISE_VERSION).
                          Checksum-verified against the release's
@@ -560,7 +561,7 @@ if [[ -n "${CLAUDE_CODE_VERSION:-}" ]]; then
 fi
 
 # Which mise.toml to bake: explicit BASE_MISE_TOML, else ./mise.toml or
-# ./.mise.toml in local mode, else none (a repo isn't cloned yet).
+# ./.mise.toml in local mode, else the one in the repo's default branch.
 BASE_TOML="${BASE_MISE_TOML:-}"
 if [[ -z "$BASE_TOML" ]] && $LOCAL_MODE; then
   for candidate in mise.toml .mise.toml; do
@@ -569,6 +570,43 @@ if [[ -z "$BASE_TOML" ]] && $LOCAL_MODE; then
       break
     fi
   done
+elif [[ -z "$BASE_TOML" ]]; then
+  # Repo mode: read mise.toml from the repo on the HOST, using the same
+  # credential the in-guest clone will use. The token never reaches the
+  # build VM, which has open egress. A shallow, blob-less clone keeps this
+  # to a few KB. The credential goes in via git's env config, not argv, so
+  # it doesn't show up in `ps`.
+  command -v git >/dev/null 2>&1 || { echo "git is required on the host to read the repo's mise.toml (or set BASE_MISE_TOML)" >&2; exit 1; }
+  if $USE_GH_APP; then
+    fetch_token="$(cat "$TOKEN_FILE")"
+  else
+    fetch_token="$DEPLOY_TOKEN"
+  fi
+  fetch_auth="$(printf 'x-access-token:%s' "$fetch_token" | base64 | tr -d '\n')"
+  unset fetch_token
+  probe_dir="${WORKDIR}/probe"
+  echo "== Reading mise.toml from ${REPO_URL} =="
+  if ! GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=1 \
+       GIT_CONFIG_KEY_0=http.extraHeader \
+       GIT_CONFIG_VALUE_0="Authorization: Basic ${fetch_auth}" \
+       git clone --quiet --depth 1 --no-checkout --filter=blob:none \
+         "https://${REPO_URL#https://}" "$probe_dir"; then
+    echo "Could not clone ${REPO_URL} on the host to read its mise.toml (set BASE_MISE_TOML to skip this)" >&2
+    exit 1
+  fi
+  for candidate in mise.toml .mise.toml; do
+    if git -C "$probe_dir" cat-file -e "HEAD:${candidate}" 2>/dev/null; then
+      # The blob is fetched lazily, so the credential is needed again here.
+      GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=1 \
+        GIT_CONFIG_KEY_0=http.extraHeader \
+        GIT_CONFIG_VALUE_0="Authorization: Basic ${fetch_auth}" \
+        git -C "$probe_dir" show "HEAD:${candidate}" > "${WORKDIR}/repo-mise.toml"
+      BASE_TOML="${WORKDIR}/repo-mise.toml"
+      break
+    fi
+  done
+  unset fetch_auth
+  [[ -n "$BASE_TOML" ]] || echo "   no mise.toml in the repo: baking Claude Code only"
 fi
 if [[ -n "$BASE_TOML" && ! -f "$BASE_TOML" ]]; then
   echo "BASE_MISE_TOML points to a nonexistent file: $BASE_TOML" >&2
