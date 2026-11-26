@@ -166,7 +166,7 @@ TOKEN_REFRESH_INTERVAL="${TOKEN_REFRESH_INTERVAL_SECONDS:-2700}"
 # to install (apt, the mise release download, tool downloads, npm) happens
 # once, while the base pack is built, with unrestricted egress and no
 # credentials mounted -- see ensure_base_pack below.
-DEFAULT_ALLOW_HOSTS=(registry.npmjs.org api.anthropic.com github.com codeload.github.com api.github.com raw.githubusercontent.com)
+DEFAULT_ALLOW_HOSTS=(api.anthropic.com github.com codeload.github.com api.github.com raw.githubusercontent.com)
 
 # Base packs (see ensure_base_pack) are cached here, one per config hash.
 PACK_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/smol-agent-sandbox/packs"
@@ -724,7 +724,7 @@ ALLOW_HOSTS=("${DEFAULT_ALLOW_HOSTS[@]}")
 if $LOCAL_MODE; then
   # No repo and no repo credential in local mode, so GitHub egress isn't
   # needed by default (add it back via ALLOW_HOSTS_EXTRA if your task does).
-  ALLOW_HOSTS=(registry.npmjs.org api.anthropic.com raw.githubusercontent.com)
+  ALLOW_HOSTS=(api.anthropic.com raw.githubusercontent.com)
 fi
 if [[ -n "${ALLOW_HOSTS_EXTRA:-}" ]]; then
   # shellcheck disable=SC2206
